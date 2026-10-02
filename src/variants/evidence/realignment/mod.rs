@@ -25,15 +25,16 @@ use crate::reference;
 use crate::utils;
 use crate::variants::evidence::observations::read_observation::Strand;
 use crate::variants::evidence::realignment::edit_distance::EditDistanceCalculation;
-use crate::variants::evidence::realignment::pairhmm::{ReadEmission, ReferenceEmissionParams};
+use crate::variants::evidence::realignment::pairhmm::{
+    LinearReadVsAlleleEmission, ReadEmission, ReferenceEmissionParams,
+};
 use crate::variants::types::{AlleleSupport, AlleleSupportBuilder, SingleLocus};
 
 pub(crate) mod edit_distance;
-pub(crate) mod linear_pairhmm;
 pub(crate) mod pairhmm;
 
 use crate::variants::evidence::realignment::edit_distance::EditDistanceHit;
-use bio::stats::pairhmm::HomopolyPairHMM;
+use bio::stats::pairhmm::{HomopolyPairHMM, LinearPairHMM};
 
 use self::edit_distance::EditDistance;
 use self::pairhmm::RefBaseEmission;
@@ -512,7 +513,7 @@ pub(crate) trait Realigner {
 pub(crate) struct PairHMMRealigner {
     gap_params: pairhmm::GapParams,
     pairhmm: PairHMM,
-    linear_pairhmm: linear_pairhmm::LinearPairHMM,
+    linear_pairhmm: LinearPairHMM,
     allele_window: Vec<u8>,
     max_window: u64,
     ref_buffer: Arc<reference::Buffer>,
@@ -526,7 +527,7 @@ impl PairHMMRealigner {
         max_window: u64,
     ) -> Self {
         let pairhmm = PairHMM::new(&gap_params);
-        let linear_pairhmm = linear_pairhmm::LinearPairHMM::new(&gap_params);
+        let linear_pairhmm = LinearPairHMM::new(&gap_params);
         PairHMMRealigner {
             gap_params,
             pairhmm,
@@ -560,28 +561,32 @@ impl Realigner for PairHMMRealigner {
         // Just to be sure that we don't miss some ambiguity, we add some additional
         // edit operations to the band.
         let max_edit_dist = hit.dist_upper_bound();
-        if max_edit_dist > linear_pairhmm::MAX_EDIT_DIST
-            || allele_params.read_emission().len() > linear_pairhmm::MAX_LEN_Y
-        {
-            // METHOD: bands this wide or windows this long could underflow in linear space (see
-            // linear_pairhmm), hence fall back to the log-space implementation.
-            return self
-                .pairhmm
-                .prob_related(allele_params, &self.gap_params, Some(max_edit_dist));
-        }
 
-        // Materialize the allele window once, so that the HMM inner loop reads plain bytes
-        // instead of going through the trait object for every cell.
+        // METHOD: The forward algorithm runs in linear probability space, which is several
+        // times faster than the log-space one. Materialize the allele window once, so that the
+        // HMM inner loop reads plain bytes instead of going through the trait object for every
+        // cell.
         self.allele_window.clear();
         self.allele_window.extend(
             (0..RefBaseEmission::len_x(allele_params))
                 .map(|i| allele_params.ref_base(i).to_ascii_uppercase()),
         );
-        self.linear_pairhmm.prob_related(
-            allele_params.read_emission(),
-            &self.allele_window,
-            max_edit_dist,
-        )
+        let linear_params = LinearReadVsAlleleEmission {
+            read_emission: allele_params.read_emission(),
+            allele: &self.allele_window,
+        };
+        match self.linear_pairhmm.prob_related(
+            &linear_params,
+            &self.gap_params,
+            Some(max_edit_dist),
+        ) {
+            Some(prob) => prob,
+            // METHOD: the probability underflowed in linear space (very long or very divergent
+            // windows): compute it in log space instead.
+            None => self
+                .pairhmm
+                .prob_related(allele_params, &self.gap_params, Some(max_edit_dist)),
+        }
     }
 }
 

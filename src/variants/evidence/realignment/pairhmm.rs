@@ -396,6 +396,44 @@ impl<'a> pairhmm::EmissionParameters for ReadVsAlleleEmission<'a> {
     }
 }
 
+/// Linear-space view of a read against an allele window, for `bio`'s `LinearPairHMM`.
+///
+/// The allele bases are materialized (upper case) once per realignment, so that the HMM
+/// inner loop reads plain bytes and precomputed probabilities instead of going through the
+/// emission trait object for every cell.
+pub(crate) struct LinearReadVsAlleleEmission<'a> {
+    pub(crate) read_emission: &'a ReadEmission<'a>,
+    pub(crate) allele: &'a [u8],
+}
+
+impl<'a> bio::stats::pairhmm::LinearEmissionParameters for LinearReadVsAlleleEmission<'a> {
+    #[inline]
+    fn prob_emit_xy(&self, i: usize, j: usize) -> (f64, bool) {
+        self.read_emission
+            .prob_match_mismatch_linear(j, *unsafe { self.allele.get_unchecked(i) })
+    }
+
+    #[inline]
+    fn prob_emit_x(&self, _: usize) -> f64 {
+        1.0
+    }
+
+    #[inline]
+    fn prob_emit_y(&self, j: usize) -> f64 {
+        self.read_emission.prob_insertion_linear(j)
+    }
+
+    #[inline]
+    fn len_x(&self) -> usize {
+        self.allele.len()
+    }
+
+    #[inline]
+    fn len_y(&self) -> usize {
+        self.read_emission.len()
+    }
+}
+
 impl<'a> bio::stats::pairhmm::Emission for ReadVsAlleleEmission<'a> {
     fn emission_x(&self, i: usize) -> u8 {
         self.allele_emission.ref_base(i)
